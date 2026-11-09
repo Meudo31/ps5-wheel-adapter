@@ -57,6 +57,8 @@ been tried on a real wheel and console.
   every push (`.github/workflows/build.yml`).
 - Unknown feature-report requests from the console are answered with zeros
   instead of stale buffer contents.
+- **Status LED strip** (optional): 8 NeoPixels on GPIO6 show every connection,
+  every step in progress and every error, see below.
 
 ## Origin, credit, and license
 
@@ -160,6 +162,37 @@ PS5. The Type-A port added above is the downstream host connection for the USB
 hub.
 
 ![Adapter connection diagram](diagram.png)
+
+## Optional status LED strip
+
+A strip of 8 WS2812 ("NeoPixel") LEDs shows what is connected, what is still
+connecting and what has failed. Wire it to the Pico as follows:
+
+| Raspberry Pi Pico | LED strip |
+| --- | --- |
+| GPIO6, physical pin 9 | DIN, through a 330-470 ohm resistor |
+| VBUS, physical pin 40 | 5V |
+| GND, physical pin 38 | GND |
+
+The strip is dimmed (`STATUS_LED_BRIGHTNESS` in `src/status_leds.h`), so 8 LEDs
+draw well under the console port's budget. A 3.3 V data signal drives most
+strips over a short wire. The adapter works the same with no strip attached.
+
+Green = OK, blinking yellow = in progress, blinking red = error, off = nothing
+connected or not used.
+
+| LED | Shows | Other colours |
+| --- | --- | --- |
+| 1 | PS5 link | blue: console in rest mode |
+| 2 | USB port 1 (GPIO0/1) | red after 5 s: something is plugged in but nothing usable enumerated (hub, cable or power problem) |
+| 3 | USB port 2 (GPIO2/3) | same as port 1 |
+| 4 | Authentication controller | steady yellow: present, console has not asked yet; red: exchange took over 10 s, or the console asked with no controller attached |
+| 5 | Wheel | cyan: ready in Driving Force compatibility mode; red: did not come back after the native-mode switch |
+| 6 | External Arduino brake | red: disconnected or silent |
+| 7 | Force feedback | dim colour = profile (white linear, green 12 %, yellow 18 %, magenta progressive, cyan measured LUT), flashes on each command, red for 1 s when a command is dropped |
+| 8 | Summary | green: console, authentication and wheel all ready; yellow: something still connecting; red: any error above |
+
+The G27's own RPM LEDs keep their status patterns as well.
 
 ## Flash and connect the adapter
 

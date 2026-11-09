@@ -25,15 +25,19 @@ add_executable(adapter
     src/ffb.c
     src/pedal.c
     src/auth_detect.c
+    src/status_leds.c
+    src/ws2812.c
     src/profile_store.c
     src/descriptors.c
 )
 target_compile_features(adapter PRIVATE c_std_11)
+pico_generate_pio_header(adapter ${CMAKE_CURRENT_LIST_DIR}/src/ws2812.pio)
 target_compile_definitions(adapter PRIVATE PICO_FLASH_ASSUME_CORE1_SAFE=1)
 target_include_directories(adapter PRIVATE src)
 target_link_libraries(adapter
     pico_stdlib
     pico_flash
+    hardware_pio
     hardware_exception
     tinyusb_host
     tinyusb_device

@@ -282,6 +282,37 @@ int main(void) {
     now += AUTOCENTER_REFRESH_MS;
     wheel_init_task();
     assert(!autocenter_refresh_pending && ffb_queue.autocenter_reasserted>=1);
+    // Status LED inputs.
+    assert(wheel_status()==STATUS_WHEEL_NATIVE);
+    external_brake.selected=false; assert(brake_status(now)==STATUS_BRAKE_UNUSED);
+    assert(auth_status()==STATUS_AUTH_IDLE);
+    uint8_t nonce_part_report[63]={0};
+    for(uint8_t part=0;part<5;part++) {
+        nonce_part_report[1]=part;
+        tud_hid_set_report_cb(0,0xF0,HID_REPORT_TYPE_FEATURE,nonce_part_report,63);
+    }
+    assert(auth_status()==STATUS_AUTH_EXCHANGING);
+    now += STATUS_AUTH_TIMEOUT_MS;
+    status_task(now);
+    assert(auth_status()==STATUS_AUTH_FAILED);
+    // A new exchange clears the failure; delivering the signature marks success.
+    for(uint8_t part=0;part<5;part++) {
+        nonce_part_report[1]=part;
+        tud_hid_set_report_cb(0,0xF0,HID_REPORT_TYPE_FEATURE,nonce_part_report,63);
+    }
+    assert(auth_status()==STATUS_AUTH_EXCHANGING);
+    uint8_t sig_reply[63];
+    signature_part=0;
+    for(unsigned part=0;part<19;part++) tud_hid_get_report_cb(0,0xF1,HID_REPORT_TYPE_FEATURE,sig_reply,63);
+    assert(auth_status()==STATUS_AUTH_OK);
+    tuh_hid_umount_cb(6,0);
+    assert(auth_status()==STATUS_AUTH_ABSENT);
+    // The console asking with no controller attached is reported as a failure.
+    for(uint8_t part=0;part<5;part++) {
+        nonce_part_report[1]=part;
+        tud_hid_set_report_cb(0,0xF0,HID_REPORT_TYPE_FEATURE,nonce_part_report,63);
+    }
+    assert(auth_status()==STATUS_AUTH_FAILED);
     puts("Adapter routing, G27 LEDs, fair authentication and FFB retries passed.");
     return 0;
 }

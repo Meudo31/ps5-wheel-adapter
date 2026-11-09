@@ -21,6 +21,11 @@
 #include "profile_store.h"
 #include "pedal.h"
 #include "auth_detect.h"
+#include "status_leds.h"
+#if !defined(_MSC_VER) && !defined(HOST_TEST)
+#include "pio_usb_ll.h"
+#include "ws2812.h"
+#endif
 
 uint8_t nonce_id;
 uint8_t nonce[280];
@@ -38,6 +43,10 @@ uint8_t auth_device = 0;
 uint8_t auth_instance = 0;
 // How sure we are that auth_device is the PS4 authentication controller.
 auth_rank_t auth_rank = AUTH_RANK_NONE;
+// Authentication progress, for the status LEDs.
+bool auth_exchange_active, auth_exchange_ok, auth_exchange_failed;
+uint32_t auth_exchange_started;
+bool wheel_switch_failed;
 uint8_t brake_device = 0;
 uint8_t brake_instance = 0;
 bool brake_receive_pending = false;
@@ -423,6 +432,7 @@ void wheel_init_task() {
         if (expecting_native && (uint32_t) (now - wheel_wait_started) >= 5000u) {
             expecting_native = false;
             ffb_clear(&ffb_queue);
+            wheel_switch_failed = true;
             printf("G27 did not re-enumerate; reconnect the wheel\n");
         }
         return;
@@ -618,6 +628,122 @@ static void auth_transfer_finished(void) {
     auth_yield_started_at = adapter_millis();
 }
 
+// ---------------------------------------------------------------------------
+// Status LEDs
+
+static void auth_status_task(uint32_t now) {
+    if (auth_exchange_active && (uint32_t) (now - auth_exchange_started) >= STATUS_AUTH_TIMEOUT_MS) {
+        auth_exchange_active = false;
+        auth_exchange_failed = true;
+        printf("Authentication exchange timed out\n");
+    }
+}
+
+static status_auth_t auth_status(void) {
+    if (auth_exchange_failed) return STATUS_AUTH_FAILED;
+    if (!auth_device) return STATUS_AUTH_ABSENT;
+    if (auth_exchange_active) return STATUS_AUTH_EXCHANGING;
+    if (auth_exchange_ok) return STATUS_AUTH_OK;
+    return STATUS_AUTH_IDLE;
+}
+
+static status_wheel_t wheel_status(void) {
+    if (!wheel_device) {
+        if (expecting_native) return STATUS_WHEEL_SWITCHING;
+        return wheel_switch_failed ? STATUS_WHEEL_FAILED : STATUS_WHEEL_ABSENT;
+    }
+    switch (wheel_phase) {
+        case WHEEL_PREPARE_NATIVE: case WHEEL_REVERT_ON_RESET:
+        case WHEEL_SWITCH_NATIVE: case WHEEL_WAIT_NATIVE: return STATUS_WHEEL_SWITCHING;
+        case WHEEL_READY: return wheel_pid == G27_PID ? STATUS_WHEEL_NATIVE : STATUS_WHEEL_COMPAT;
+        default: return STATUS_WHEEL_SETUP;
+    }
+}
+
+static status_brake_t brake_status(uint32_t now) {
+    if (!external_brake.selected) return STATUS_BRAKE_UNUSED;
+    bool fault = !external_brake.connected || !external_brake.has_sample ||
+        (uint32_t) (now - external_brake.updated_ms) >= BRAKE_TIMEOUT_MS;
+    return fault ? STATUS_BRAKE_FAULT : STATUS_BRAKE_OK;
+}
+
+#if !defined(_MSC_VER) && !defined(HOST_TEST)
+#define STATUS_FRAME_MS 33u
+#define STATUS_MAX_HID 16u
+static struct { uint8_t dev_addr, instance, root; bool used; } hid_mounts[STATUS_MAX_HID];
+static bool status_strip_ok;
+static status_leds_t status_leds;
+static bool port_was_connected[2];
+static uint32_t port_connected_at[2];
+static uint32_t status_last_frame;
+
+// Which root port (0 or 1) a device sits behind, found through the PIO-USB
+// endpoint pool. Devices behind a hub report the hub's root port.
+static int device_root_port(uint8_t dev_addr) {
+    for (unsigned i = 0; i < PIO_USB_EP_POOL_CNT; i++) {
+        endpoint_t* ep = PIO_USB_ENDPOINT(i);
+        if (ep->size && ep->dev_addr == dev_addr) return ep->root_idx;
+    }
+    return -1;
+}
+
+static void status_hid_mounted(uint8_t dev_addr, uint8_t instance) {
+    int root = device_root_port(dev_addr);
+    if (root < 0 || root > 1) return;
+    for (unsigned i = 0; i < STATUS_MAX_HID; i++) {
+        if (!hid_mounts[i].used) {
+            hid_mounts[i].used = true;
+            hid_mounts[i].dev_addr = dev_addr;
+            hid_mounts[i].instance = instance;
+            hid_mounts[i].root = (uint8_t) root;
+            return;
+        }
+    }
+}
+
+static void status_hid_unmounted(uint8_t dev_addr, uint8_t instance) {
+    for (unsigned i = 0; i < STATUS_MAX_HID; i++) {
+        if (hid_mounts[i].used && hid_mounts[i].dev_addr == dev_addr && hid_mounts[i].instance == instance) {
+            hid_mounts[i].used = false;
+        }
+    }
+}
+
+static void status_task(uint32_t now) {
+    auth_status_task(now);
+    if (!status_strip_ok || (uint32_t) (now - status_last_frame) < STATUS_FRAME_MS) return;
+
+    status_inputs_t in;
+    memset(&in, 0, sizeof(in));
+    in.ps5 = !tud_mounted() ? STATUS_PS5_WAITING : tud_suspended() ? STATUS_PS5_SUSPENDED : STATUS_PS5_CONNECTED;
+    for (unsigned port = 0; port < 2; port++) {
+        root_port_t* root = PIO_USB_ROOT_PORT(port);
+        in.port_present[port] = root->initialized;
+        in.port_connected[port] = root->initialized && root->connected;
+        if (in.port_connected[port] && !port_was_connected[port]) port_connected_at[port] = now;
+        port_was_connected[port] = in.port_connected[port];
+        in.port_connected_ms[port] = port_connected_at[port];
+    }
+    for (unsigned i = 0; i < STATUS_MAX_HID; i++) {
+        if (hid_mounts[i].used && in.port_devices[hid_mounts[i].root] < 255u) in.port_devices[hid_mounts[i].root]++;
+    }
+    in.auth = auth_status();
+    in.wheel = wheel_status();
+    in.brake = brake_status(now);
+    in.ffb_profile = (uint8_t) ffb_queue.profile;
+    in.ffb_sent = ffb_queue.sent;
+    in.ffb_overflows = ffb_queue.overflows;
+
+    uint32_t colours[STATUS_LED_COUNT];
+    status_leds_render(&status_leds, &in, now, colours);
+    if (ws2812_show(colours, STATUS_LED_COUNT)) status_last_frame = now;
+}
+#else
+static void status_hid_mounted(uint8_t dev_addr, uint8_t instance) { (void) dev_addr; (void) instance; }
+static void status_hid_unmounted(uint8_t dev_addr, uint8_t instance) { (void) dev_addr; (void) instance; }
+static void status_task(uint32_t now) { auth_status_task(now); }
+#endif
+
 int main() {
     board_init();
     report_init();
@@ -642,6 +768,11 @@ int main() {
     pio_usb_host_add_port(PICO_DEFAULT_PIO_USB_DP_PIN2);
 #endif
     stdio_init_all();
+#if !defined(_MSC_VER) && !defined(HOST_TEST)
+    status_leds_init(&status_leds);
+    status_strip_ok = ws2812_init();
+    printf("Status LED strip on GPIO%d: %s\n", STATUS_LED_PIN, status_strip_ok ? "enabled" : "no free PIO state machine");
+#endif
     printf("FFB profile: %s\n", ffb_profile_name(ffb_queue.profile));
     adapter_led_show_profile(ffb_queue.profile, adapter_millis());
 
@@ -653,6 +784,7 @@ int main() {
         auth_task();
         wheel_init_task();
         profile_store_task(&profile_store, adapter_millis());
+        status_task(adapter_millis());
         adapter_led_task(adapter_millis());
     }
 
@@ -743,6 +875,9 @@ uint16_t tud_hid_get_report_cb(uint8_t itf, uint8_t report_id, hid_report_type_t
                 signature_part = 0;
                 printf("\n");
                 adapter_led_set_auth(true);
+                auth_exchange_active = false;
+                auth_exchange_ok = true;
+                auth_exchange_failed = false;
                 g27_leds_show_ready(&g27_leds, adapter_millis());
             }
             return length;
@@ -789,6 +924,14 @@ void tud_hid_set_report_cb(uint8_t itf, uint8_t report_id, hid_report_type_t rep
             printf("Sending reset to auth controller...\n");
             state = SENDING_RESET;
             nonce_part = 0;
+            auth_exchange_active = true;
+            auth_exchange_failed = false;
+            auth_exchange_started = adapter_millis();
+            if (!auth_device) {
+                auth_exchange_active = false;
+                auth_exchange_failed = true;
+                printf("Console started authentication but no controller is connected\n");
+            }
         }
     } else {
         // The original adapter accepted every non-auth SET_REPORT here. Keep
@@ -806,6 +949,7 @@ void tuh_hid_mount_cb(uint8_t dev_addr, uint8_t instance, uint8_t const* desc_re
     tuh_vid_pid_get(dev_addr, &vid, &pid);
 
     printf("tuh_hid_mount_cb %04x:%04x %d %d\n", vid, pid, dev_addr, instance);
+    status_hid_mounted(dev_addr, instance);
 
     if ((vid == LOGITECH_VID) && (pid == DRIVING_FORCE_PID || pid == G27_PID)) {
         if (wheel_device) return;
@@ -830,6 +974,7 @@ void tuh_hid_mount_cb(uint8_t dev_addr, uint8_t instance, uint8_t const* desc_re
         // Unsupported wheels time out and continue in compatibility mode.
         wheel_phase = pid == G27_PID ? WHEEL_STOP_FORCES : WHEEL_PREPARE_NATIVE;
         autocenter_refresh_pending = false;
+        wheel_switch_failed = false;
         for (unsigned i = 0; i < 3; i++) pedal_cal_reset(&pedal_cal[i]);
         wheel_controls_reset();
     } else if ((vid == BRAKE_USB_VID) && (pid == BRAKE_USB_PID)) {
@@ -864,6 +1009,7 @@ void tuh_hid_mount_cb(uint8_t dev_addr, uint8_t instance, uint8_t const* desc_re
 
 void tuh_hid_umount_cb(uint8_t dev_addr, uint8_t instance) {
     printf("tuh_hid_umount_cb\n");
+    status_hid_unmounted(dev_addr, instance);
     if ((dev_addr == wheel_device) && (instance == wheel_instance)) {
         wheel_device = 0;
         wheel_instance = 0;
@@ -889,6 +1035,7 @@ void tuh_hid_umount_cb(uint8_t dev_addr, uint8_t instance) {
         auth_device = 0;
         auth_instance = 0;
         auth_rank = AUTH_RANK_NONE;
+        auth_exchange_ok = false;
         busy = false;
         auth_yield_for_ffb = false;
         nonce_part = 0;
