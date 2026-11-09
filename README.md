@@ -23,13 +23,48 @@ lets you verify the download.
 Follow the hardware assembly instructions below, then
 [flash and connect the adapter](#flash-and-connect-the-adapter).
 
+## Fixes in this revision
+
+These changes address problems seen in the code and reported by users of the
+upstream adapter. They pass the host tests and build cleanly, but have not yet
+been tried on a real wheel and console.
+
+- **No hub needed.** An optional second downstream port on GPIO2/GPIO3 lets the
+  wheel and the authentication controller each have their own port, avoiding
+  hubs that do not enumerate, do not pass enough power, or block sign-in. A hub
+  on either port still works, and existing one-port builds need no rewiring.
+- **Reliable authentication controller choice.** Previously the most recently
+  connected non-wheel HID interface became the authentication controller, so a
+  controller with several interfaces, or any extra USB device, could take its
+  place and authentication failed. The adapter now prefers the interface whose
+  HID descriptor declares the PS4 authentication reports (0xF0-0xF3) and never
+  lets a later, less likely interface replace it.
+- **Stiff wheel / autocenter.** Classic Logitech wheels turn their autocenter
+  spring back on after a range command, and some ignore setup commands during
+  their power-on calibration. Upstream users reported a wheel stuck hard to the
+  center that needed several replugs. The adapter now re-sends "autocenter off"
+  after every console range command and once more four seconds after the wheel
+  is ready, unless the console has explicitly enabled autocenter.
+- **Pedal range.** Worn pedals that never reach their end stops are now
+  calibrated automatically (`src/pedal.h`), so full travel gives full output even
+  in games without pedal calibration such as Assetto Corsa Competizione. The
+  range is relearned each time the wheel connects; until a pedal has been
+  pressed fully once it may saturate slightly early. A two-count release
+  deadzone prevents creeping throttle or brake. Build with `-DPEDAL_AUTOCAL=0`
+  for the previous linear mapping. The optional Arduino brake is unchanged.
+- **Host tests build on Linux and macOS** with GCC or Clang, not only MSVC.
+- **Continuous integration** builds `adapter.uf2` and runs the host tests on
+  every push (`.github/workflows/build.yml`).
+- Unknown feature-report requests from the console are answered with zeros
+  instead of stale buffer contents.
+
 ## Origin, credit, and license
 
 This repository is a personal fork of
 [jfedor2/wheel-adapter](https://github.com/jfedor2/wheel-adapter). The original
 adapter design, PS5 authentication implementation, wiring instructions, photos,
 and initial Logitech compatibility support were created by
-[Jan Fedor](https://github.com/jfedor2). The original commit history and
+[Jacek Fedorynski](https://github.com/jfedor2). The original commit history and
 dependency submodules are preserved.
 
 This fork adds native G27 operation, standalone load-cell braking, a more robust
@@ -84,7 +119,7 @@ devices fail to enumerate.
 - Raspberry Pi Pico or a compatible RP2040 board.
 - USB Type-A female connector, from either a breakout board or a cut extension
   cable.
-- USB hub for the wheel, authentication controller, and optional Arduino.
+- A second USB Type-A connector, or a USB hub, for the wheel, authentication controller, and optional Arduino.
 - Supported Logitech wheel with its normal power supply.
 - Officially licensed PS4 specialty controller that works in PS5 games.
 - Optional Arduino Micro exposing the supported load-cell HID report.
@@ -103,6 +138,15 @@ Add a downstream USB port to the Pico using these connections:
 | --- | --- |
 | GPIO0, physical pin 1 | D+; commonly green |
 | GPIO1, physical pin 2 | D-; commonly white |
+| VBUS, physical pin 40 | VBUS / 5 V |
+| GND, physical pin 38 | Ground |
+
+Optionally add a second Type-A port, so that no hub is needed:
+
+| Raspberry Pi Pico | Second USB port |
+| --- | --- |
+| GPIO2, physical pin 4 | D+; commonly green |
+| GPIO3, physical pin 5 | D-; commonly white |
 | VBUS, physical pin 40 | VBUS / 5 V |
 | GND, physical pin 38 | Ground |
 
@@ -125,9 +169,11 @@ hub.
 3. Open the `RPI-RP2` drive that appears.
 4. Copy the downloaded `adapter.uf2` to that drive. The Pico automatically reboots.
 5. Disconnect the Pico from the computer.
-6. Connect the wheel and authentication controller to the downstream USB hub.
-   Connect the Arduino Micro too if using the external brake.
-7. Connect the hub to the Type-A host port added to the Pico.
+6. With two ports: connect the wheel to one and the authentication controller
+   to the other. With one port: connect the wheel and authentication controller
+   to a USB hub. Connect the Arduino Micro too if using the external brake
+   (through a hub on either port when both ports are taken).
+7. Connect the hub, if any, to a Type-A host port added to the Pico.
 8. Power the wheel, then connect the Pico's built-in USB port to the PS5.
 
 The wheel should calibrate and center during startup. On a G27, the firmware

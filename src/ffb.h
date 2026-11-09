@@ -22,6 +22,12 @@ typedef struct {
     uint32_t received, sent, transformed, suppressed_leds, overflows, blocked_mode_changes, invalid;
     ffb_profile_t profile;
     bool profiles_enabled;
+    // Classic Logitech wheels turn their autocenter spring back on after a
+    // range command. A G29, which is what the console believes it drives,
+    // does not, so the adapter re-sends "autocenter off" after each range
+    // command unless the console itself asked for autocenter.
+    bool console_autocenter;
+    uint32_t autocenter_reasserted;
 } ffb_queue_t;
 
 // Report 5 over control excludes its ID; interrupt OUT includes the ID. Unknown
@@ -31,6 +37,9 @@ const uint8_t* ffb_front(const ffb_queue_t* queue);
 void ffb_pop(ffb_queue_t* queue);
 void ffb_suppress_front_led(ffb_queue_t* queue);
 void ffb_clear(ffb_queue_t* queue);
+// Queue "autocenter off" unless the console has enabled autocenter.
+bool ffb_reassert_autocenter_off(ffb_queue_t* queue);
+bool ffb_command_is_range(const uint8_t* command);
 bool ffb_command_is_rpm_led(const uint8_t* command);
 bool ffb_profile_valid(uint8_t profile);
 void ffb_set_profile(ffb_queue_t* queue, ffb_profile_t profile);

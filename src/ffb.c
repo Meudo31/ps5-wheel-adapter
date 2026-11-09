@@ -6,6 +6,8 @@
 #define LG_DOWNLOAD 0x00u
 #define LG_DOWNLOAD_AND_PLAY 0x01u
 #define LG_REFRESH 0x0cu
+#define LG_DEFAULT_SPRING_ON 0x04u
+#define LG_DEFAULT_SPRING_OFF 0x05u
 #define LG_CONSTANT_FORCE 0x00u
 #define LG_VARIABLE_FORCE 0x08u
 
@@ -94,6 +96,36 @@ static bool transform_torque_force(ffb_queue_t* queue, uint8_t command[FFB_COMMA
     return changed;
 }
 
+static const uint8_t autocenter_off[FFB_COMMAND_SIZE] = { 0xf5, 0, 0, 0, 0, 0, 0 };
+
+bool ffb_command_is_range(const uint8_t* command) {
+    if (!command) return false;
+    // f8 81: G25/G27/DFGT/G29 range. f8 02/f8 03: DFP coarse 200/900 degrees.
+    // 81 0b: DFP fine limit. hid-lg4ff uses these same encodings.
+    return (command[0] == 0xf8u && (command[1] == 0x81u || command[1] == 0x02u || command[1] == 0x03u)) ||
+        (command[0] == 0x81u && command[1] == 0x0bu);
+}
+
+static bool queue_push(ffb_queue_t* queue, const uint8_t* data) {
+    if (queue->count == FFB_QUEUE_CAPACITY) {
+        queue->overflows++;
+        return false;
+    }
+    uint8_t* command = queue->commands[(queue->head + queue->count) % FFB_QUEUE_CAPACITY];
+    memcpy(command, data, FFB_COMMAND_SIZE);
+    if (transform_torque_force(queue, command)) queue->transformed++;
+    queue->count++;
+    if (queue->count > queue->high_water) queue->high_water = queue->count;
+    return true;
+}
+
+bool ffb_reassert_autocenter_off(ffb_queue_t* queue) {
+    if (!queue || queue->console_autocenter) return false;
+    if (!queue_push(queue, autocenter_off)) return false;
+    queue->autocenter_reasserted++;
+    return true;
+}
+
 bool ffb_enqueue_report(ffb_queue_t* queue, uint8_t report_id, const uint8_t* data, size_t length) {
     if (!data) { queue->invalid++; return false; }
     if (report_id == 0 && length && data[0] == 5) {
@@ -117,15 +149,12 @@ bool ffb_enqueue_report(ffb_queue_t* queue, uint8_t report_id, const uint8_t* da
         return false;
     }
     queue->received++;
-    if (queue->count == FFB_QUEUE_CAPACITY) {
-        queue->overflows++;
-        return false;
-    }
-    uint8_t* command = queue->commands[(queue->head + queue->count) % FFB_QUEUE_CAPACITY];
-    memcpy(command, data, FFB_COMMAND_SIZE);
-    if (transform_torque_force(queue, command)) queue->transformed++;
-    queue->count++;
-    if (queue->count > queue->high_water) queue->high_water = queue->count;
+    // Classic protocol op 0x4 turns the default (autocenter) spring on and op
+    // 0x5 turns it off; the high nibble only selects slots (0x14, 0xf5...).
+    if ((data[0] & LG_COMMAND_MASK) == LG_DEFAULT_SPRING_ON) queue->console_autocenter = true;
+    else if ((data[0] & LG_COMMAND_MASK) == LG_DEFAULT_SPRING_OFF) queue->console_autocenter = false;
+    if (!queue_push(queue, data)) return false;
+    if (ffb_command_is_range(data)) ffb_reassert_autocenter_off(queue);
     return true;
 }
 
@@ -154,6 +183,7 @@ void ffb_suppress_front_led(ffb_queue_t* queue) {
 void ffb_clear(ffb_queue_t* queue) {
     queue->head = 0;
     queue->count = 0;
+    queue->console_autocenter = false;
 }
 
 bool ffb_profile_valid(uint8_t profile) {

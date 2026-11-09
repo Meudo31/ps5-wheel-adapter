@@ -24,6 +24,8 @@ int main(void) {
     }
     mode[1]=0x12; assert(ffb_enqueue_report(&q,5,mode,7)); ffb_pop(&q);
     mode[1]=0x81; assert(ffb_enqueue_report(&q,5,mode,7)); ffb_pop(&q);
+    // A range command is followed by an adapter-generated "autocenter off".
+    assert(ffb_front(&q)[0]==0xf5 && q.autocenter_reasserted==1); ffb_pop(&q);
     assert(!ffb_enqueue_report(&q,5,damper,6));
     assert(!ffb_enqueue_report(&q,3,damper,7));
     for(unsigned cycle=0;cycle<3;cycle++) {
@@ -87,6 +89,32 @@ int main(void) {
     assert(ffb_command_is_rpm_led(ffb_front(&q)));
     ffb_suppress_front_led(&q);
     assert(!q.count && q.suppressed_leds==1);
+    // Autocenter follows the console: once it enables the spring (0x14),
+    // range commands are forwarded alone; 0xf5 from the console reverts that.
+    ffb_clear(&q);
+    const uint8_t range[]={0xf8,0x81,0x84,0x03,0,0,0};
+    const uint8_t enable_spring[]={0x14,0,0,0,0,0,0};
+    const uint8_t disable_spring[]={0xf5,0,0,0,0,0,0};
+    assert(ffb_enqueue_report(&q,5,range,7) && q.count==2);
+    assert(!memcmp(ffb_front(&q),range,7)); ffb_pop(&q);
+    assert(ffb_front(&q)[0]==0xf5); ffb_pop(&q);
+    assert(ffb_enqueue_report(&q,5,enable_spring,7)); ffb_pop(&q);
+    assert(q.console_autocenter);
+    assert(ffb_enqueue_report(&q,5,range,7) && q.count==1); ffb_pop(&q);
+    assert(!ffb_reassert_autocenter_off(&q) && !q.count);
+    assert(ffb_enqueue_report(&q,5,disable_spring,7)); ffb_pop(&q);
+    assert(!q.console_autocenter && ffb_reassert_autocenter_off(&q) && q.count==1);
+    ffb_pop(&q);
+    // DFP coarse/fine range commands count as range commands too.
+    const uint8_t dfp_coarse[]={0xf8,0x03,0,0,0,0,0}, dfp_fine[]={0x81,0x0b,0x19,0xe6,0xff,0x4a,0xff};
+    assert(ffb_command_is_range(dfp_coarse) && ffb_command_is_range(dfp_fine));
+    assert(!ffb_command_is_range(rpm_leds) && !ffb_command_is_range(NULL));
+    // A full queue drops the extra command instead of overwriting another.
+    ffb_clear(&q);
+    for(unsigned i=0;i<FFB_QUEUE_CAPACITY;i++) assert(ffb_enqueue_report(&q,5,disable_spring,7));
+    unsigned overflow_before=q.overflows;
+    assert(!ffb_reassert_autocenter_off(&q) && q.overflows==overflow_before+1);
+    ffb_clear(&q);
     profile_store_t store;
     assert(profile_store_init(&store,FFB_PROFILE_MINIMUM_12)==FFB_PROFILE_MINIMUM_12);
     profile_store_schedule(&store,FFB_PROFILE_PROGRESSIVE,100);

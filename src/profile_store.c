@@ -37,7 +37,7 @@ static bool profile_record_valid(const profile_record_t* record) {
         ffb_profile_valid(record->profile) && record->checksum == profile_checksum(record);
 }
 
-#ifndef _MSC_VER
+#if !defined(_MSC_VER) && !defined(HOST_TEST)
 #include "hardware/address_mapped.h"
 #include "hardware/flash.h"
 #include "pico/flash.h"
@@ -64,7 +64,7 @@ static void __not_in_flash_func(profile_flash_write)(void* argument) {
 uint8_t profile_store_init(profile_store_t* store, uint8_t fallback_profile) {
     memset(store, 0, sizeof(*store));
     store->profile = ffb_profile_valid(fallback_profile) ? fallback_profile : FFB_PROFILE_MINIMUM_12;
-#ifndef _MSC_VER
+#if !defined(_MSC_VER) && !defined(HOST_TEST)
     // Protect the journal if a future firmware ever grows into the last sector.
     if ((uintptr_t) &__flash_binary_end - XIP_BASE > PROFILE_FLASH_OFFSET) return store->profile;
     store->available = true;
@@ -85,6 +85,7 @@ uint8_t profile_store_init(profile_store_t* store, uint8_t fallback_profile) {
         }
     }
 #else
+    (void) profile_record_valid;
     store->available = true;
 #endif
     return store->profile;
@@ -99,7 +100,7 @@ void profile_store_schedule(profile_store_t* store, uint8_t profile, uint32_t no
 
 void profile_store_task(profile_store_t* store, uint32_t now) {
     if (!store || !store->pending || (uint32_t) (now - store->pending_since) < PROFILE_SAVE_DELAY_MS) return;
-#ifndef _MSC_VER
+#if !defined(_MSC_VER) && !defined(HOST_TEST)
     profile_flash_operation_t operation;
     memset(&operation, 0xff, sizeof(operation));
     operation.slot = store->next_slot < PROFILE_RECORD_COUNT ? store->next_slot : 0;

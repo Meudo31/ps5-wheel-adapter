@@ -4,6 +4,8 @@ add_compile_definitions(PICO_DEFAULT_UART_BAUD_RATE=921600)
 add_compile_definitions(PICO_DEFAULT_UART_TX_PIN=16)
 add_compile_definitions(PICO_DEFAULT_UART_RX_PIN=17)
 add_compile_definitions(PICO_DEFAULT_PIO_USB_DP_PIN=0)
+# Optional second downstream USB port on GPIO2 (D+) / GPIO3 (D-).
+add_compile_definitions(PICO_DEFAULT_PIO_USB_DP_PIN2=2)
 
 set(PICO_SDK_PATH "${CMAKE_CURRENT_LIST_DIR}/pico-sdk")
 set(PICO_TINYUSB_PATH "${CMAKE_CURRENT_LIST_DIR}/tinyusb")
@@ -21,6 +23,8 @@ add_executable(adapter
     src/g27.c
     src/g27_leds.c
     src/ffb.c
+    src/pedal.c
+    src/auth_detect.c
     src/profile_store.c
     src/descriptors.c
 )

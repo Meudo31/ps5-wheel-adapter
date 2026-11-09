@@ -48,7 +48,9 @@ int main(void) {
     wheel.brake = 123;
     tuh_hid_report_received_cb(1, 0, (const uint8_t*) &wheel, sizeof(wheel));
     hid_task();
-    assert(report.brake == 123u << 8);
+    // Wheel pedals go through automatic range calibration (src/pedal.c).
+    pedal_cal_t expected_pedal; pedal_cal_reset(&expected_pedal);
+    assert(report.brake == pedal_cal_apply(&expected_pedal, 123));
     // Arduino before auth, and additional Arduino interfaces, must not claim auth.
     tuh_hid_mount_cb(2, 1, NULL, 0);
     tuh_hid_mount_cb(2, 2, NULL, 0);
@@ -101,7 +103,7 @@ int main(void) {
     hid_task();
     assert(report.brake == 0);
     tuh_hid_report_received_cb(1, 0, (const uint8_t*) &wheel, 1);
-    assert(wheel_brake == 255u << 8);
+    assert(wheel_brake == UINT16_MAX);
     // Compatibility-mode Logitech wheels send the proven interrupt-OUT sequence
     // before input polling: autocenter off, revert-on-reset, then native G27.
     assert(wheel_phase==WHEEL_PREPARE_NATIVE && !wheel_receive_pending);
@@ -139,7 +141,7 @@ int main(void) {
         tuh_hid_report_sent_cb(1,0,last_command,7);
         now += 20;
     }
-    assert(wheel_phase==WHEEL_READY);
+    assert(wheel_phase==WHEEL_READY && autocenter_refresh_pending);
     external_brake.selected=false;
     // Native-ready status sweeps the wheel's RPM LEDs before ordinary traffic.
     console_ready=false; accept_host=true; accept_receive=false; wheel_init_task();
@@ -223,6 +225,10 @@ int main(void) {
     memset(feature_reply,0xaa,sizeof(feature_reply));
     assert(tud_hid_get_report_cb(0,0xf3,HID_REPORT_TYPE_FEATURE,feature_reply,16)==7);
     assert(feature_reply[7]==0xaa);
+    // Unknown feature reports are answered with zeros, never stale bytes.
+    memset(feature_reply,0xaa,sizeof(feature_reply));
+    assert(tud_hid_get_report_cb(0,0x42,HID_REPORT_TYPE_FEATURE,feature_reply,16)==16);
+    for(unsigned i=0;i<16;i++) assert(feature_reply[i]==0);
     tuh_hid_report_received_cb(1,0,native_ps,0);
     assert(!wheel_receive_pending);
     // Authentication submission advances only after a successful completion.
@@ -250,6 +256,32 @@ int main(void) {
     tuh_hid_umount_cb(3,0);
     assert(!busy && !auth_device && state==SENDING_RESET);
     tuh_hid_umount_cb(1,0); assert(report.clutch==65535 && report.gears==0);
+    // Authentication candidates: an interface that declares the PS4 auth
+    // reports wins and is never displaced by a later, unrelated interface.
+    static const uint8_t auth_desc[]={0x85,0xF0,0x09,0x47,0x95,0x3F,0xB1,0x02};
+    static const uint8_t pad_desc[]={0x85,0x01,0x09,0x30,0x81,0x02};
+    tuh_hid_mount_cb(4,0,pad_desc,sizeof(pad_desc));
+    assert(auth_device==4 && auth_rank==AUTH_RANK_NO_AUTH_REPORTS);
+    tuh_hid_mount_cb(5,0,auth_desc,sizeof(auth_desc));
+    assert(auth_device==5 && auth_rank==AUTH_RANK_CONFIRMED);
+    tuh_hid_mount_cb(5,1,pad_desc,sizeof(pad_desc));
+    tuh_hid_mount_cb(6,0,NULL,0);
+    assert(auth_device==5 && auth_instance==0);
+    tuh_hid_umount_cb(5,0);
+    assert(!auth_device && auth_rank==AUTH_RANK_NONE);
+    tuh_hid_mount_cb(6,0,NULL,0);
+    assert(auth_device==6 && auth_rank==AUTH_RANK_UNKNOWN);
+
+    // "Autocenter off" is re-sent once after the wheel's calibration sweep,
+    // unless the console has enabled autocenter itself.
+    mock_wheel_pid=G27_PID; tuh_hid_mount_cb(1,0,NULL,0);
+    accept_host=true; accept_receive=true;
+    for(unsigned i=0;i<4;i++) { wheel_init_task(); tuh_hid_report_sent_cb(1,0,last_command,7); now+=20; }
+    assert(wheel_phase==WHEEL_READY && autocenter_refresh_pending);
+    ffb_clear(&ffb_queue);
+    now += AUTOCENTER_REFRESH_MS;
+    wheel_init_task();
+    assert(!autocenter_refresh_pending && ffb_queue.autocenter_reasserted>=1);
     puts("Adapter routing, G27 LEDs, fair authentication and FFB retries passed.");
     return 0;
 }

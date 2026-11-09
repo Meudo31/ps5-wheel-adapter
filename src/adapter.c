@@ -4,12 +4,12 @@
 
 #include "bsp/board_api.h"
 #include "tusb.h"
-#ifndef _MSC_VER
+#if !defined(_MSC_VER) && !defined(HOST_TEST)
 #include "pio_usb.h"
 #endif
 
 #include "pico/stdio.h"
-#ifndef _MSC_VER
+#if !defined(_MSC_VER) && !defined(HOST_TEST)
 #include "pico/time.h"
 #endif
 
@@ -19,6 +19,8 @@
 #include "g27_leds.h"
 #include "ffb.h"
 #include "profile_store.h"
+#include "pedal.h"
+#include "auth_detect.h"
 
 uint8_t nonce_id;
 uint8_t nonce[280];
@@ -34,6 +36,8 @@ uint8_t wheel_device = 0;
 uint8_t wheel_instance = 0;
 uint8_t auth_device = 0;
 uint8_t auth_instance = 0;
+// How sure we are that auth_device is the PS4 authentication controller.
+auth_rank_t auth_rank = AUTH_RANK_NONE;
 uint8_t brake_device = 0;
 uint8_t brake_instance = 0;
 bool brake_receive_pending = false;
@@ -92,9 +96,15 @@ uint32_t wheel_wait_started, wheel_tx_retries;
 uint32_t wheel_tx_retry_at, wheel_receive_retry_at;
 uint32_t wheel_last_diagnostic;
 ffb_queue_t ffb_queue = { 0 };
+pedal_cal_t pedal_cal[3]; // throttle, wheel brake, clutch
+// Some wheels ignore setup commands while they run their power-on
+// calibration sweep, so "autocenter off" is sent again once it is over.
+#define AUTOCENTER_REFRESH_MS 4000u
+bool autocenter_refresh_pending;
+uint32_t autocenter_refresh_at;
 
 static uint32_t adapter_millis(void) {
-#ifdef _MSC_VER
+#if defined(_MSC_VER) || defined(HOST_TEST)
     return board_millis();
 #else
     return to_ms_since_boot(get_absolute_time());
@@ -350,6 +360,11 @@ static bool deadline_reached(uint32_t now, uint32_t deadline) {
     return (int32_t) (now - deadline) >= 0;
 }
 
+static void wheel_schedule_autocenter_refresh(void) {
+    autocenter_refresh_pending = true;
+    autocenter_refresh_at = adapter_millis() + AUTOCENTER_REFRESH_MS;
+}
+
 static void wheel_command_succeeded() {
     wheel_init_failures = 0;
     switch (wheel_phase) {
@@ -357,10 +372,18 @@ static void wheel_command_succeeded() {
         case WHEEL_REVERT_ON_RESET: wheel_phase = WHEEL_SWITCH_NATIVE; break;
         case WHEEL_SWITCH_NATIVE: wheel_phase = WHEEL_WAIT_NATIVE; break;
         case WHEEL_STOP_FORCES: wheel_phase = WHEEL_AUTOCENTER_OFF; break;
-        case WHEEL_AUTOCENTER_OFF: wheel_phase = wheel_pid == G27_PID ? WHEEL_RANGE : WHEEL_READY; break;
+        case WHEEL_AUTOCENTER_OFF:
+            if (wheel_pid == G27_PID) {
+                wheel_phase = WHEEL_RANGE;
+            } else {
+                wheel_phase = WHEEL_READY;
+                wheel_schedule_autocenter_refresh();
+            }
+            break;
         case WHEEL_RANGE: wheel_phase = WHEEL_LEDS_OFF; break;
         case WHEEL_LEDS_OFF:
             wheel_phase = WHEEL_READY;
+            wheel_schedule_autocenter_refresh();
             g27_leds_show_ready(&g27_leds, adapter_millis());
             printf("G27 native inputs and FFB ready\n");
             break;
@@ -378,6 +401,7 @@ static void wheel_setup_command_failed(uint32_t now) {
             wheel_mode_failures = 0;
             if (wheel_phase == WHEEL_SWITCH_NATIVE) {
                 wheel_phase = WHEEL_READY;
+                wheel_schedule_autocenter_refresh();
                 printf("Native-mode switch failed; retaining compatibility mode\n");
             } else {
                 printf("Native-mode preparation command failed; continuing sequence\n");
@@ -407,6 +431,7 @@ void wheel_init_task() {
         if ((uint32_t) (now - wheel_wait_started) >= 3000u) {
             expecting_native = false;
             wheel_phase = WHEEL_READY;
+            wheel_schedule_autocenter_refresh();
             printf("Native-mode switch timed out; retaining compatibility mode\n");
         }
         return;
@@ -452,6 +477,10 @@ void wheel_init_task() {
     if (!wheel_receive_pending && deadline_reached(now, wheel_receive_retry_at)) {
         wheel_receive_pending = tuh_hid_receive_report(wheel_device, wheel_instance);
         if (!wheel_receive_pending) wheel_receive_retry_at = now + 10u;
+    }
+    if (autocenter_refresh_pending && deadline_reached(now, autocenter_refresh_at)) {
+        autocenter_refresh_pending = false;
+        if (ffb_reassert_autocenter_off(&ffb_queue)) printf("Autocenter off re-sent after wheel calibration\n");
     }
     bool brake_fault = external_brake.selected &&
         (!external_brake.connected || !external_brake.has_sample ||
@@ -501,14 +530,15 @@ void wheel_init_task() {
     // UART diagnostics only; no USB identity/interface changes.
     if ((uint32_t) (now - wheel_last_diagnostic) >= 10000u) {
         wheel_last_diagnostic = now;
-        printf("FFB profile=%s rx=%lu shaped=%lu sent=%lu queued=%u peak=%u retries=%lu overflow=%lu auth_yields=%lu led_suppressed=%lu blocked_modes=%lu\n",
+        printf("FFB profile=%s rx=%lu shaped=%lu sent=%lu queued=%u peak=%u retries=%lu overflow=%lu auth_yields=%lu led_suppressed=%lu blocked_modes=%lu autocenter_off=%lu\n",
             ffb_profile_name(ffb_queue.profile),
             (unsigned long) ffb_queue.received, (unsigned long) ffb_queue.transformed,
             (unsigned long) ffb_queue.sent,
             ffb_queue.count, ffb_queue.high_water, (unsigned long) wheel_tx_retries,
             (unsigned long) ffb_queue.overflows, (unsigned long) auth_ffb_yields,
             (unsigned long) ffb_queue.suppressed_leds,
-            (unsigned long) ffb_queue.blocked_mode_changes);
+            (unsigned long) ffb_queue.blocked_mode_changes,
+            (unsigned long) ffb_queue.autocenter_reasserted);
     }
 }
 
@@ -592,7 +622,7 @@ int main() {
     board_init();
     report_init();
     ffb_set_profile(&ffb_queue, (ffb_profile_t) profile_store_init(&profile_store, FFB_PROFILE_MINIMUM_12));
-#ifndef _MSC_VER
+#if !defined(_MSC_VER) && !defined(HOST_TEST)
     // Preserve the two-PIO layout used by the repository's proven 2023 host
     // stack. New Pico-PIO-USB defaults both engines to PIO0, which prevents the
     // existing downstream hub from enumerating on this RP2040 adapter.
@@ -605,6 +635,12 @@ int main() {
     tuh_configure(BOARD_TUH_RHPORT, TUH_CFGID_RPI_PIO_USB_CONFIGURATION, &pio_config);
 #endif
     tusb_init();
+#if !defined(_MSC_VER) && !defined(HOST_TEST) && defined(PICO_DEFAULT_PIO_USB_DP_PIN2)
+    // Second downstream port (GPIO2 = D+, GPIO3 = D-): plug the wheel into one
+    // port and the authentication controller into the other, no hub needed.
+    // A hub on either port keeps working as before.
+    pio_usb_host_add_port(PICO_DEFAULT_PIO_USB_DP_PIN2);
+#endif
     stdio_init_all();
     printf("FFB profile: %s\n", ffb_profile_name(ffb_queue.profile));
     adapter_led_show_profile(ffb_queue.profile, adapter_millis());
@@ -721,6 +757,8 @@ uint16_t tud_hid_get_report_cb(uint8_t itf, uint8_t report_id, hid_report_type_t
             return length;
         }
     }
+    // Unknown feature report: answer with zeros rather than stale buffer bytes.
+    memset(buffer, 0, reqlen);
     return reqlen;
 }
 
@@ -791,6 +829,8 @@ void tuh_hid_mount_cb(uint8_t dev_addr, uint8_t instance, uint8_t const* desc_re
         // host, so attempt the reversible G27 native-mode sequence directly.
         // Unsupported wheels time out and continue in compatibility mode.
         wheel_phase = pid == G27_PID ? WHEEL_STOP_FORCES : WHEEL_PREPARE_NATIVE;
+        autocenter_refresh_pending = false;
+        for (unsigned i = 0; i < 3; i++) pedal_cal_reset(&pedal_cal[i]);
         wheel_controls_reset();
     } else if ((vid == BRAKE_USB_VID) && (pid == BRAKE_USB_PID)) {
         // Reserve every HID interface of this device so it can never replace auth.
@@ -802,9 +842,23 @@ void tuh_hid_mount_cb(uint8_t dev_addr, uint8_t instance, uint8_t const* desc_re
             external_brake_connect(&external_brake);
             printf("External Arduino brake connected\n");
         }
-    } else {  // retain the original auth-controller convention for other devices
-        auth_device = dev_addr;
-        auth_instance = instance;
+    } else {
+        // Any other HID interface may be the authentication controller. The
+        // original firmware let the most recently mounted interface win, so a
+        // controller with several interfaces, or any extra USB device, could
+        // silently replace the real one and authentication then failed.
+        // Prefer the interface whose report descriptor declares the PS4
+        // authentication feature reports (0xF0-0xF3).
+        auth_rank_t rank = auth_rank_from_descriptor(desc_report, desc_len);
+        if (rank > auth_rank) {
+            auth_device = dev_addr;
+            auth_instance = instance;
+            auth_rank = rank;
+            printf("Authentication candidate %d:%d (%s)\n", dev_addr, instance, auth_rank_name(rank));
+        } else {
+            printf("Ignoring HID interface %d:%d, already using %d:%d for authentication\n",
+                dev_addr, instance, auth_device, auth_instance);
+        }
     }
 }
 
@@ -834,6 +888,7 @@ void tuh_hid_umount_cb(uint8_t dev_addr, uint8_t instance) {
         bool transaction_pending = state != IDLE;
         auth_device = 0;
         auth_instance = 0;
+        auth_rank = AUTH_RANK_NONE;
         busy = false;
         auth_yield_for_ffb = false;
         nonce_part = 0;
@@ -858,6 +913,9 @@ void tuh_hid_report_received_cb(uint8_t dev_addr, uint8_t instance, uint8_t cons
         }
         if (wheel_pid == G27_PID) {
             if (g27_decode(report_, len, &report, &wheel_brake)) {
+                report.throttle = pedal_cal_apply(&pedal_cal[0], report_[5]);
+                wheel_brake = pedal_cal_apply(&pedal_cal[1], report_[6]);
+                report.clutch = pedal_cal_apply(&pedal_cal[2], report_[7]);
                 wheel_select_raw = report.select;
                 wheel_start_raw = report.start;
                 wheel_l3_raw = report.L3;
@@ -868,8 +926,8 @@ void tuh_hid_report_received_cb(uint8_t dev_addr, uint8_t instance, uint8_t cons
         if (len >= sizeof(df_report_t)) {
             const df_report_t* df = (const df_report_t*) report_;
             report.wheel = df->wheel << 6;
-            report.throttle = df->throttle << 8;
-            wheel_brake = df->brake << 8;
+            report.throttle = pedal_cal_apply(&pedal_cal[0], df->throttle);
+            wheel_brake = pedal_cal_apply(&pedal_cal[1], df->brake);
             report.dpad = df->hat;
             report.cross = df->cross;
             report.square = df->square;

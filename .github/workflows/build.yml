@@ -1,0 +1,34 @@
+name: build
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  firmware:
+    runs-on: ubuntu-24.04
+    env:
+      # The pinned Pico SDK host tools predate CMake 4.
+      CMAKE_POLICY_VERSION_MINIMUM: "3.5"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Install toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-arm-none-eabi libnewlib-arm-none-eabi libstdc++-arm-none-eabi-newlib ninja-build
+      - name: Host tests
+        run: |
+          cmake -S tests -B build-host-tests -G Ninja
+          cmake --build build-host-tests --parallel
+          ctest --test-dir build-host-tests --output-on-failure
+      - name: Firmware
+        run: |
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --parallel
+      - uses: actions/upload-artifact@v4
+        with:
+          name: adapter-uf2
+          path: build/adapter.uf2
